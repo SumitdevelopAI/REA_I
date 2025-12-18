@@ -8,11 +8,10 @@ from typing import List, Dict, Any
 import logging
 
 # ============================================================
-# DYNAMIC PATH SETUP (Works on Windows & Render)
+# DYNAMIC PATH SETUP (Critical for Cloud Deployment)
 # ============================================================
-# Get the absolute path of the directory where retriever.py is located
+# This calculates the path regardless of the OS (Windows or Linux)
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-# Move up one level to the project root where the data files are stored
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 
 DEFAULT_VECTOR_DB = os.path.join(PROJECT_ROOT, "vector_store.faiss")
@@ -28,46 +27,51 @@ class IntelligentSearcher:
 
         # Robust check for data files in the root
         if not os.path.exists(self.vector_db_path) or not os.path.exists(self.metadata_path):
-            logging.error(f"Data files not found in project root: {PROJECT_ROOT}")
+            logging.error(f"❌ Data files missing at: {PROJECT_ROOT}")
+            logging.info(f"Searched for: {self.vector_db_path}")
             raise FileNotFoundError("vector_store.faiss or metadata.pkl missing from root.")
 
-        logging.info(f"Loading metadata from {self.metadata_path}")
+        logging.info(f"✅ Loading metadata from {self.metadata_path}")
         with open(self.metadata_path, "rb") as f:
-            self.metadata = pickle.load(f)["metadata"]
+            # Assumes your pickle file structure is {'metadata': [...]}
+            data = pickle.load(f)
+            self.metadata = data["metadata"] if isinstance(data, dict) else data
 
-        logging.info(f"Loading FAISS index from {self.vector_db_path}")
+        logging.info(f"✅ Loading FAISS index from {self.vector_db_path}")
         self.index = faiss.read_index(self.vector_db_path)
 
-        # Set device (Render Free Tier will use CPU)
+        # Set device (Render Free Tier will use CPU automatically)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        logging.info(f"🖥️ Using device: {self.device}")
+        
         self.retriever = SentenceTransformer(RETRIEVER_MODEL_NAME, device=self.device)
         self.reranker = CrossEncoder(RERANKER_MODEL_NAME, device=self.device)
 
     def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+        # 1. Retriever: Vector Search (FAISS)
         query_vec = self.retriever.encode(
             [query],
             convert_to_numpy=True,
             normalize_embeddings=True
         )
 
-        # Initial broad retrieval (Top 30 candidates)
+        # Retrieve 30 candidates for better re-ranking precision
         _, indices = self.index.search(query_vec, 30)
 
         candidates = []
         for idx in indices[0]:
-            if idx < len(self.metadata):
+            if 0 <= idx < len(self.metadata):
                 item = self.metadata[idx]
+                
+                # Format strings for Cross-Encoder context
                 t_type = item.get("test_type", [])
-                if isinstance(t_type, list):
-                    t_type = ", ".join(t_type)
-
+                t_type_str = ", ".join(t_type) if isinstance(t_type, list) else str(t_type)
                 job_lvl = item.get("job_levels", "All Levels")
 
-                # Rich context for re-ranking
                 rich_text = (
-                    f"Assessment Title: {item['name']}\n"
-                    f"Category: {t_type}\n"
-                    f"Target Levels: {job_lvl}\n"
+                    f"Title: {item['name']}\n"
+                    f"Type: {t_type_str}\n"
+                    f"Level: {job_lvl}\n"
                     f"Description: {item['description']}"
                 )
                 candidates.append({"doc": item, "text": rich_text})
@@ -75,36 +79,39 @@ class IntelligentSearcher:
         if not candidates:
             return []
 
-        # Cross-Encoder Re-ranking for Precision
+        # 2. Re-ranker: Cross-Encoder (MS-MARCO) for Recall@K optimization
         pairs = [[query, c["text"]] for c in candidates]
         scores = self.reranker.predict(pairs)
 
         for i, score in enumerate(scores):
             candidates[i]["score"] = float(score)
 
-        # Sort and return Top K
+        # Sort by re-ranker score
         candidates.sort(key=lambda x: x["score"], reverse=True)
         selected = candidates[:top_k]
 
+        # 3. Final Output Formatting
         results = []
         for cand in selected:
             doc = cand["doc"]
-            # Ensure duration is a clean integer
+            
+            # Clean duration field
             duration = doc.get("duration", 45)
             if not isinstance(duration, int):
                 try:
-                    duration = int(str(duration).replace(" mins", "").strip())
+                    duration = int(str(duration).lower().replace("mins", "").strip())
                 except:
                     duration = 45
 
             results.append({
                 "url": doc.get("url", ""),
-                "name": doc.get("name", ""),
-                "adaptive_support": doc.get("adaptive_support", "No"),
-                "description": doc.get("description", "")[:600],
+                "name": doc.get("name", "Unknown Assessment"),
+                "description": doc.get("description", "")[:600], # Trimmed for UI
                 "duration": duration,
+                "job_levels": doc.get("job_levels", "All Levels"),
+                "test_type": doc.get("test_type", []),
                 "remote_support": doc.get("remote_support", "Yes"),
-                "test_type": doc.get("test_type", [])
+                "adaptive_support": doc.get("adaptive_support", "No")
             })
 
         return results
