@@ -7,7 +7,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 from typing import List, Dict, Any
 
 
-DATA_DIR = r"D:\REA\data"
+DATA_DIR = r"D:\REA"
 DEFAULT_VECTOR_DB = os.path.join(DATA_DIR, "vector_store.faiss")
 DEFAULT_METADATA = os.path.join(DATA_DIR, "metadata.pkl")
 
