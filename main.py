@@ -11,8 +11,10 @@ import time
 # ============================================================
 # PATH SETUP
 # ============================================================
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Ensure data file path is absolute for Render stability
+DATA_PATH = os.path.join(BASE_DIR, "test_catalog.json")
+
 SRC_DIR = os.path.join(BASE_DIR, "src")
 sys.path.append(SRC_DIR)
 
@@ -23,67 +25,50 @@ except Exception as e:
     sys.exit(1)
 
 # ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-logger = logging.getLogger("SHL-API")
-
-# ============================================================
 # FASTAPI APP
 # ============================================================
-
-app = FastAPI(
-    title="SHL Assessment Recommender API",
-    version="2.2.0",
-    description="Semantic search and ranking service for SHL assessments"
-)
+app = FastAPI(title="SHL Recommender API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 search_engine: Optional[IntelligentSearcher] = None
 
-# ============================================================
-# STARTUP EVENT
-# ============================================================
-
 @app.on_event("startup")
 async def startup_event():
     global search_engine
-    logger.info("Initializing IntelligentSearcher...")
+    logging.info("Initializing IntelligentSearcher...")
+    
+    # Critical Fix: Check if data file exists before loading
+    if not os.path.exists(DATA_PATH):
+        logging.error(f"FATAL: {DATA_PATH} not found. Ensure it is pushed to GitHub root.")
+        return
+
     try:
         search_engine = IntelligentSearcher()
-        logger.info("IntelligentSearcher initialized successfully.")
+        logging.info("IntelligentSearcher initialized successfully.")
     except Exception:
-        logger.exception("Failed to initialize IntelligentSearcher")
+        logging.exception("Failed to initialize IntelligentSearcher")
         search_engine = None
 
 # ============================================================
-# REQUEST / RESPONSE MODELS
+# MODELS (Strictly matching Appendix 2 & 3)
 # ============================================================
-
 class QueryRequest(BaseModel):
-    query: str = Field(..., min_length=2, description="Job description or role query")
-
+    query: str = Field(..., min_length=2)
 
 class AssessmentItem(BaseModel):
     url: str
     name: str
     description: str
-    duration: Optional[int] = None
-    job_levels: str
+    duration: int
     test_type: List[str]
-    remote_support: Optional[str] = None
-    adaptive_support: Optional[str] = None
-
+    remote_support: str  # Requirement: "Yes" or "No"
+    adaptive_support: str # Requirement: "Yes" or "No"
 
 class RecommendationResponse(BaseModel):
     recommended_assessments: List[AssessmentItem]
@@ -91,108 +76,47 @@ class RecommendationResponse(BaseModel):
 # ============================================================
 # DATA CLEANING UTIL
 # ============================================================
-
 def clean_assessment_data(item: dict) -> dict:
-    """
-    Normalize and clean raw assessment metadata
-    """
+    """Normalize and clean raw assessment metadata to match SHL requirements."""
     raw_desc = item.get("description", "") or ""
 
-    # ---- Duration extraction ----
-    duration = item.get("duration")
-    if not duration or duration in (0, 45):
-        match = re.search(r"(\\d+)\\s*mins", raw_desc, re.IGNORECASE)
-        if match:
-            duration = int(match.group(1))
+    # Extraction logic for SHL metadata strings
+    duration_match = re.search(r"Time in minutes = (\d+)", raw_desc)
+    duration = int(duration_match.group(1)) if duration_match else int(item.get("duration", 0))
 
-    # ---- Job level extraction ----
-    job_levels = item.get("job_levels", "All Levels")
-    if job_levels.lower() in ("all levels", "not specified"):
-        match = re.search(
-            r"Job levels\\s+(.*?)(?:,|$)",
-            raw_desc,
-            re.IGNORECASE
-        )
-        if match:
-            job_levels = match.group(1).strip()
-
-    # ---- Description cleanup ----
-    clean_desc = raw_desc
-    clean_desc = re.sub(r"Product Fact Sheet.*", "", clean_desc, flags=re.IGNORECASE)
-    clean_desc = re.sub(r"Test Type:.*", "", clean_desc, flags=re.IGNORECASE)
+    # Requirement: Standardized Yes/No strings
+    remote = "Yes" if "remote" in raw_desc.lower() or item.get("remote_support") else "No"
+    adaptive = "Yes" if "adaptive" in raw_desc.lower() or item.get("adaptive_support") else "No"
 
     return {
-        **item,
-        "description": clean_desc.strip(),
+        "url": item.get("url", ""),
+        "name": item.get("name", "Unknown Assessment"),
+        "description": raw_desc.strip(),
         "duration": duration,
-        "job_levels": job_levels
+        "test_type": item.get("test_type", ["General"]),
+        "remote_support": remote,
+        "adaptive_support": adaptive
     }
 
 # ============================================================
 # ROUTES
 # ============================================================
-
 @app.get("/health")
 async def health_check():
-    """
-    Health endpoint for frontend & monitoring
-    """
-    return {
-        "status": "healthy" if search_engine else "initializing"
-    }
-
+    """Health endpoint: Returns 200 OK and healthy status."""
+    if search_engine:
+        return {"status": "healthy"}
+    raise HTTPException(status_code=503, detail={"status": "initializing"})
 
 @app.post("/recommend", response_model=RecommendationResponse)
 async def recommend_assessments(request: QueryRequest):
-    """
-    Return ranked SHL assessments for a job query
-    """
+    """Returns Top 10 ranked SHL assessments."""
     if not search_engine:
-        raise HTTPException(
-            status_code=503,
-            detail="Search engine not ready"
-        )
-
-    start_time = time.time()
+        raise HTTPException(status_code=503, detail="Search engine initializing")
 
     try:
-        results = search_engine.search(
-            request.query,
-            top_k=10
-        )
-
-        cleaned_results = [
-            clean_assessment_data(item)
-            for item in results
-        ]
-
-        logger.info(
-            "Query='%s' | Results=%d | Time=%.2fs",
-            request.query,
-            len(cleaned_results),
-            time.time() - start_time
-        )
-
-        return {
-            "recommended_assessments": cleaned_results
-        }
-
+        results = search_engine.search(request.query, top_k=10)
+        cleaned_results = [clean_assessment_data(item) for item in results]
+        return {"recommended_assessments": cleaned_results}
     except Exception:
-        logger.exception("Recommendation failed")
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error"
-        )
-
-# ============================================================
-# LOCAL RUN (DEV ONLY)
-# ============================================================
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True
-    )
+        raise HTTPException(status_code=500, detail="Internal server error")
